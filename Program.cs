@@ -1,10 +1,15 @@
 ﻿using System;
 using System.Diagnostics;
+using System.Globalization;
 using System.Net.Http;
+using System.Net.Sockets;
+using System.Reflection.Metadata;
 using System.Text.Json;
 using AngleSharp;
 using AngleSharp.Html.Dom;
 using Microsoft.Playwright;
+using NPOI.SS.Formula.Functions;
+using UBOT_API.Common.Helpers;
 
 namespace Console1
 {
@@ -69,6 +74,10 @@ namespace Console1
             else if (input == "10")
             {
                 GetDOM10(httpClient, context).Wait();
+            }
+            else if (input == "11")
+            {
+                GetDOM11(httpClient).Wait();
             }
             else if (input == "111")
             {
@@ -186,6 +195,9 @@ namespace Console1
             // 計算總共有幾頁名言大全的資料
             var count = 0;
 
+            // 要直接存成 Excel , 所以先準備一個集合
+            var rows = new List<QuoteRow>();
+
             // 循環把每一頁資料都抓下來
             while (targetUrl != null)
             {
@@ -197,9 +209,18 @@ namespace Console1
                 }
                 foreach (var a in document.QuerySelectorAll(".quote"))
                 {
-                    string content = a.TextContent.Trim();
-                    string author = a.QuerySelector("small").TextContent.Trim();
-                    Console.WriteLine($"作者 : {author} \r\n 內容 : {content} ");
+                    string content = a.QuerySelector(".text")?.TextContent.Trim();
+                    string author = a.QuerySelector("small.author")?.TextContent.Trim();
+                    string tags = string.Join(", ", a.QuerySelectorAll(".tags").Select(t => t.TextContent.Trim()));
+
+                    rows.Add(
+                        new QuoteRow
+                        {
+                            Author = author,
+                            Content = content,
+                            Tags = tags,
+                        }
+                    );
                 }
 
                 // 找到下一頁的連結
@@ -212,7 +233,9 @@ namespace Console1
                 await Task.Delay(1000);
             }
 
-            Console.WriteLine($"總共 {count} 頁");
+            byte[] excel = ExcelHelper.CreateExcel(rows);
+            string filePath = Path.Combine("C:\\Users\\andychen\\Desktop\\爬蟲練習", "quotes.xlsx");
+            File.WriteAllBytes(filePath, excel);
         }
 
         /// <summary>
@@ -588,7 +611,12 @@ namespace Console1
                 string src = img.GetAttribute("src");
                 if (string.IsNullOrEmpty(src))
                     continue;
-
+                string srcset = img.GetAttribute("srcset");
+                if (!string.IsNullOrEmpty(srcset))
+                {
+                    string last = srcset.Split(',').Last().Trim();
+                    src = last.Split(' ')[0];
+                }
                 // 用 Uri 組合基底網址跟圖片名稱 , 合成完整的路徑
                 var imgUri = new Uri(baseUri, src);
 
@@ -623,6 +651,108 @@ namespace Console1
                 await Task.Delay(300);
             }
             Console.WriteLine($"共下載 {count} 張,位置:{saveFolder}");
+        }
+
+        /// <summary>
+        /// 拿到書籍網站的所有 DOM 資料 ( 同時拿好幾頁 )
+        /// </summary>
+        /// <param name="httpClient">HTTP 請求物件</param>
+        /// <returns>書籍資料</returns>
+        public static async Task GetDOM11(HttpClient httpClient)
+        {
+            var starMap = new Dictionary<string, int>
+            {
+                { "One", 1 },
+                { "Two", 2 },
+                { "Three", 3 },
+                { "Four", 4 },
+                { "Five", 5 },
+            };
+
+            var semaPhore = new SemaphoreSlim(3);
+            var sw = Stopwatch.StartNew();
+
+            var rows = new List<QuoteDetailsRow>();
+
+            var tasks = Enumerable
+                .Range(1, 2)
+                .Select(async page =>
+                {
+                    await semaPhore.WaitAsync();
+
+                    try
+                    {
+                        var context = BrowsingContext.New(Configuration.Default);
+
+                        // 目標網址
+                        string url = $"https://books.toscrape.com/catalogue/page-{page}.html";
+
+                        var document = await APIDocumentHelper.GetDocument(httpClient, context, url);
+
+                        // 建立放資料的 list
+                        var list = new List<string>();
+
+                        if (document == null)
+                        {
+                            Console.WriteLine("請求失敗");
+                            return list;
+                        }
+
+                        foreach (var a in document.QuerySelectorAll(".row article"))
+                        {
+                            string img = a.QuerySelector(".image_container img")?.GetAttribute("alt");
+                            string href = a.QuerySelector(".image_container a")?.GetAttribute("href");
+
+                            string bookName = a.QuerySelector("h3 a").TextContent.Trim();
+
+                            string starClass = a.QuerySelector("p.star-rating")
+                                ?.ClassList.FirstOrDefault(r => r != "star-rating");
+
+                            int star = starClass != null && starMap.TryGetValue(starClass, out var n) ? n : 0;
+
+                            string price = a.QuerySelector("p.price_color").TextContent.Trim();
+
+                            string instock = a.QuerySelector("p.availability").TextContent.Trim();
+
+                            rows.Add(
+                                new QuoteDetailsRow
+                                {
+                                    BookName = bookName,
+                                    Star = star,
+                                    Price = price,
+                                    InStock = instock,
+                                    Img = img,
+                                    Herf = href,
+                                }
+                            );
+
+                            //list.Add(
+                            //    $"[第 {page} 頁] \r\n 圖片名稱 : {img}  \r\n 圖片網址 : {href}  \r\n 書名 : {bookName} \r\n 星級 : {star}  \r\n 價格 : {price}  \r\n 有沒有庫存 : {instock}"
+                            //);
+                        }
+
+                        // 稍微讓他延遲一下以免呼叫太快打爆對面的 API
+                        await Task.Delay(500);
+
+                        return list;
+                    }
+                    finally
+                    {
+                        // 不管怎樣 , 最後都要釋放名額等下一個進來
+                        semaPhore.Release();
+                    }
+                });
+
+            // 執行緒同時進行
+            var results = await Task.WhenAll(tasks);
+
+            foreach (var pageResult in results)
+            foreach (var line in pageResult)
+                Console.WriteLine(line);
+
+            byte[] excel = ExcelHelper.CreateExcel(rows);
+            string filePath = Path.Combine("C:\\Users\\andychen\\Desktop\\爬蟲練習", "allQuotesDetails.xlsx");
+            File.WriteAllBytes(filePath, excel);
         }
 
         /// <summary>
